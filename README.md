@@ -4,6 +4,9 @@ Windows GUI tool for getting data out of ADInstruments LabChart `.adicht`
 files without needing LabChart. Signals are averaged into time buckets
 (1 minute by default) and written to CSV, Parquet or Excel.
 
+<img width="702" height="552" alt="image" src="https://github.com/user-attachments/assets/a555e883-0d1e-4381-8ea7-7405715d0971" />
+
+
 ## Download
 
 Get `AdichtExporter.exe` from the [releases page](../../releases). Single
