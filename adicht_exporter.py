@@ -3,8 +3,10 @@
 Pick one or more .adicht files, choose channels per file, and export
 time-bucket-averaged data (default 1 minute buckets) to CSV, Parquet, or
 Excel (.xlsx). LabChart comments are included as a text column in the
-main table (optional). Files are processed in parallel on background
-threads; the GUI stays live.
+main table (optional). A recording that was stopped and restarted (a
+"pause") is exported either as one table with a pause_s column marking
+each restart, or as one file per recorded section. Files are processed
+in parallel on background threads; the GUI stays live.
 
 Run directly:            python adicht_exporter.py [file1.adicht ...]
 Headless build check:    AdichtExporter.exe --selftest out.log file1.adicht ...
@@ -21,6 +23,7 @@ import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import timedelta
 
 import numpy as np
 
@@ -34,6 +37,11 @@ MAX_PARALLEL_CHANNELS = 4    # concurrent channel reads within one file
 _READ_SLOTS = threading.BoundedSemaphore(8)
 DEFAULT_BUCKET_VALUE = "1"
 DEFAULT_BUCKET_UNIT = "minutes"
+# LabChart starts a new record every time sampling is stopped and restarted.
+# False: one output file, with a pause_s column marking each restart.
+# True: one output file per record.
+DEFAULT_SPLIT_ON_PAUSE = False
+PAUSE_HEADER = "pause_s"
 
 CHECKED, UNCHECKED, PARTIAL = "☑", "☐", "◫"
 
@@ -177,6 +185,101 @@ def _write_xlsx(path, headers, columns):
     wb.save(path)
 
 
+def _record_start(rec):
+    """Wall-clock datetime of a record's first tick, or None if the SDK
+    gave no time for it.
+
+    Derived from the raw trigger fields rather than adi's rec_datetime:
+    the SDK defines the delta as trigger-minus-record-start, and
+    rec_datetime applies it with the opposite sign."""
+    rt = getattr(rec, "record_time", None)
+    trig = getattr(rt, "trig_datetime", None)
+    if trig is None:
+        return None
+    ticks = getattr(rt, "trig_start_delta", 0) or 0
+    return trig - timedelta(seconds=ticks * rec.tick_dt)
+
+
+def _pause_before(prev_rec, rec):
+    """Seconds between the end of prev_rec and the start of rec, or None
+    if it cannot be determined (no record times, or the PC clock was set
+    back between the two)."""
+    a, b = _record_start(prev_rec), _record_start(rec)
+    if a is None or b is None:
+        return None
+    gap = (b - a).total_seconds() - prev_rec.n_ticks * prev_rec.tick_dt
+    return gap if gap >= 0 else None
+
+
+def _combine_records(parts, sel_indices, bucket_s, include_comments,
+                     warn):
+    """Stack per-record tables into one table on a single time axis.
+
+    parts: [(record, table)] in record order, tables from _record_table.
+
+    time_s is real elapsed time since the first record started, so it
+    jumps across a pause. Buckets restart at the start of every record,
+    which keeps data from either side of a pause out of the same average.
+    pause_s is blank except on the first row after a pause, where it holds
+    the length of that pause in seconds. With a single record there are
+    no pauses and the column is left out, so the table is the same one
+    the split export writes.
+
+    A channel whose units change between records gets one column per
+    unit, so values in different units never share a column."""
+    n_rows = sum(t["n_buckets"] for _, t in parts)
+    time_col = np.empty(n_rows)
+    pause_col = np.full(n_rows, np.nan)
+    com_col = [None] * n_rows if include_comments else None
+    cols = {}  # (channel index, header) -> column; dicts keep insert order
+
+    row, rec_start_s, prev = 0, 0.0, None
+    for rec, t in parts:
+        n = t["n_buckets"]
+        if prev is not None:
+            pause = _pause_before(prev, rec)
+            if pause is None:
+                warn(f"length of the pause before record {rec.id} is "
+                     f"unknown; written as 0")
+                pause = 0.0
+            # The PC clock is no better than this, and it keeps the jump
+            # in time_s equal to pause_s.
+            pause = round(pause, 3)
+            rec_start_s += prev.n_ticks * prev.tick_dt + pause
+            pause_col[row] = pause
+        time_col[row:row + n] = np.round(
+            rec_start_s + np.arange(n) * float(bucket_s), 6)
+        for i, header, col in zip(sel_indices, t["headers"], t["cols"]):
+            if np.isnan(col).all():
+                continue  # channel off in this record; its units are moot
+            if (i, header) not in cols:
+                cols[(i, header)] = np.full(n_rows, np.nan)
+            cols[(i, header)][row:row + n] = col
+        if include_comments:
+            com_col[row:row + n] = t["comments"]
+        row += n
+        prev = rec
+
+    for i, header in zip(sel_indices, parts[0][1]["headers"]):
+        if not any(j == i for j, _ in cols):  # no data in any record
+            cols[(i, header)] = np.full(n_rows, np.nan)
+    keys = sorted(cols, key=lambda k: k[0])  # stable: channel order
+    for i in sel_indices:
+        names = [h for j, h in keys if j == i]
+        if len(names) > 1:
+            warn(f"units change between records, so the channel is "
+                 f"split into columns: {', '.join(names)}")
+    headers = ["time_s"] + [h for _, h in keys]
+    columns = [time_col] + [cols[k] for k in keys]
+    if len(parts) > 1:
+        headers.append(PAUSE_HEADER)
+        columns.append(pause_col)
+    if include_comments:
+        headers.append("comments")
+        columns.append(com_col)
+    return _dedupe(headers), columns
+
+
 def _average_channel(path, rec_id, ch_index, bucket_s, n_buckets,
                      emit, cancel):
     """Bucket-average one channel of one record. Opens its OWN file handle
@@ -217,15 +320,65 @@ def _average_channel(path, rec_id, ch_index, bucket_s, n_buckets,
         del f
 
 
+def _record_table(f, path, rec, sel_indices, bucket_s, include_comments,
+                  emit, cancel):
+    """Bucket-average the selected channels of one record. Channels are
+    read in parallel, each on its own thread with its own file handle.
+
+    Returns None if the record has no data for the selected channels,
+    else {"n_buckets", "headers", "cols", "comments"}: one header and one
+    column per selected channel, and the comments column (None unless
+    include_comments), each comment in the bucket containing it."""
+    rec_idx = rec.id - 1
+    sel = [f.channels[i] for i in sel_indices]
+
+    n_buckets = 0
+    for ch in sel:
+        n = ch.n_samples[rec_idx]
+        fs = ch.fs[rec_idx]
+        if n and fs > 0:
+            n_buckets = max(n_buckets,
+                            int((n - 1) // (bucket_s * fs)) + 1)
+    if n_buckets == 0:
+        return None
+
+    headers = [_col_header({"name": str(c.name),
+                            "units": [str(u) for u in c.units]}, rec_idx)
+               for c in sel]
+
+    with ThreadPoolExecutor(
+            max_workers=min(MAX_PARALLEL_CHANNELS,
+                            len(sel_indices))) as ex:
+        cols = list(ex.map(
+            lambda i: _average_channel(path, rec.id, i, bucket_s,
+                                       n_buckets, emit, cancel),
+            sel_indices))
+
+    com_col = None
+    if include_comments:
+        com_col = [None] * n_buckets
+        for c in (rec.comments or []):
+            b = min(int(c.tick_position * rec.tick_dt // bucket_s),
+                    n_buckets - 1)
+            com_col[b] = (f"{com_col[b]} | {c.text}"
+                          if com_col[b] else c.text)
+    return {"n_buckets": n_buckets, "headers": headers, "cols": cols,
+            "comments": com_col}
+
+
 def export_one(path, out_base, sel_indices, bucket_s, fmt, out_dir,
-               include_comments, emit, cancel):
-    """Export one .adicht file: per record, one wide table of per-bucket
-    means for the selected channels. Channels may have different sample
-    rates; buckets are aligned by time. Channels are read in parallel,
-    each on its own thread with its own file handle.
+               include_comments, split_on_pause, emit, cancel):
+    """Export one .adicht file as wide tables of per-bucket means for the
+    selected channels. Channels may have different sample rates; buckets
+    are aligned by time.
 
     include_comments: add a "comments" text column to the table; each
-    LabChart comment lands in the bucket containing its timestamp."""
+    LabChart comment lands in the bucket containing its timestamp.
+
+    split_on_pause: LabChart starts a new record each time sampling is
+    stopped and restarted. True writes one file per record, with time_s
+    restarting at 0 in each. False writes a single file holding every
+    record (see _combine_records)."""
     import adi
     f = adi.read_file(path)
     written = []
@@ -233,59 +386,47 @@ def export_one(path, out_base, sel_indices, bucket_s, fmt, out_dir,
         ext = {"parquet": "parquet", "xlsx": "xlsx"}.get(fmt, "csv")
         writer = {"parquet": _write_parquet,
                   "xlsx": _write_xlsx}.get(fmt, _write_csv)
-        for rec in f.records:
-            if cancel.is_set():
-                raise ExportCancelled()
-            rec_idx = rec.id - 1
-            sel = [f.channels[i] for i in sel_indices]
 
-            n_buckets = 0
-            for ch in sel:
-                n = ch.n_samples[rec_idx]
-                fs = ch.fs[rec_idx]
-                if n and fs > 0:
-                    n_buckets = max(n_buckets,
-                                    int((n - 1) // (bucket_s * fs)) + 1)
-            if n_buckets == 0:
-                emit({"type": "log",
-                      "msg": f"{out_base}: record {rec.id} has no data "
-                             f"for the selected channels; skipped"})
-                continue
-
-            chan_headers = [_col_header(f_ch_meta, rec_idx) for f_ch_meta in
-                            ({"name": str(c.name),
-                              "units": [str(u) for u in c.units]}
-                             for c in sel)]
-            time_col = np.round(np.arange(n_buckets) * float(bucket_s), 6)
-
-            with ThreadPoolExecutor(
-                    max_workers=min(MAX_PARALLEL_CHANNELS,
-                                    len(sel_indices))) as ex:
-                chan_cols = list(ex.map(
-                    lambda i: _average_channel(path, rec.id, i, bucket_s,
-                                               n_buckets, emit, cancel),
-                    sel_indices))
-            columns = [time_col] + chan_cols
-
-            if include_comments:
-                chan_headers.append("comments")
-                com_col = [None] * n_buckets
-                for c in (rec.comments or []):
-                    b = min(int(c.tick_position * rec.tick_dt // bucket_s),
-                            n_buckets - 1)
-                    com_col[b] = (f"{com_col[b]} | {c.text}"
-                                  if com_col[b] else c.text)
-                columns.append(com_col)
-            headers = ["time_s"] + _dedupe(chan_headers)
-
-            suffix = f"_record{rec.id}" if len(f.records) > 1 else ""
+        def write(suffix, headers, columns, note=""):
             out_path = os.path.join(
                 out_dir, f"{out_base}{suffix}_avg{bucket_s:g}s.{ext}")
             writer(out_path, headers, columns)
             written.append(out_path)
             emit({"type": "log",
-                  "msg": f"Wrote {out_path} ({n_buckets:,} rows)"})
+                  "msg": f"Wrote {out_path} "
+                         f"({len(columns[0]):,} rows{note})"})
 
+        parts = []
+        for rec in f.records:
+            if cancel.is_set():
+                raise ExportCancelled()
+            t = _record_table(f, path, rec, sel_indices, bucket_s,
+                              include_comments, emit, cancel)
+            if t is None:
+                emit({"type": "log",
+                      "msg": f"{out_base}: record {rec.id} has no data "
+                             f"for the selected channels; skipped"})
+            elif split_on_pause:
+                headers = ["time_s"] + t["headers"]
+                columns = [np.round(np.arange(t["n_buckets"])
+                                    * float(bucket_s), 6)] + t["cols"]
+                if include_comments:
+                    headers.append("comments")
+                    columns.append(t["comments"])
+                write(f"_record{rec.id}" if len(f.records) > 1 else "",
+                      _dedupe(headers), columns)
+            else:
+                parts.append((rec, t))
+
+        if parts:
+            headers, columns = _combine_records(
+                parts, sel_indices, bucket_s, include_comments,
+                warn=lambda m: emit({"type": "log",
+                                     "msg": f"{out_base}: {m}"}))
+            n_pauses = len(parts) - 1
+            write("", headers, columns,
+                  f", {n_pauses} pause{'s' if n_pauses != 1 else ''}"
+                  if n_pauses else "")
     finally:
         del f
     return written
@@ -397,13 +538,20 @@ def main_gui(initial_files):
                     variable=comments_var).grid(
         row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
+    split_var = tk.BooleanVar(value=DEFAULT_SPLIT_ON_PAUSE)
+    ttk.Checkbutton(opts, text="Split into a separate file at each pause "
+                               f"(otherwise one file with a {PAUSE_HEADER} "
+                               "column)",
+                    variable=split_var).grid(
+        row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
     ttk.Label(opts, text="Output folder:").grid(
-        row=2, column=0, sticky="w", pady=(6, 0))
+        row=3, column=0, sticky="w", pady=(6, 0))
     outdir_var = tk.StringVar(value="")
     out_entry = ttk.Entry(opts, textvariable=outdir_var)
-    out_entry.grid(row=2, column=1, sticky="ew", padx=(6, 4), pady=(6, 0))
+    out_entry.grid(row=3, column=1, sticky="ew", padx=(6, 4), pady=(6, 0))
     btn_browse = ttk.Button(opts, text="Browse…")
-    btn_browse.grid(row=2, column=2, sticky="w", pady=(6, 0))
+    btn_browse.grid(row=3, column=2, sticky="w", pady=(6, 0))
     opts.columnconfigure(1, weight=1)
 
     bottom = ttk.Frame(root, padding=(10, 4, 10, 10))
@@ -531,8 +679,10 @@ def main_gui(initial_files):
         info = state["files"][key]
         info["meta"] = meta
         nrec = len(meta["records"])
+        pauses = (f" ({nrec - 1} pause{'s' if nrec != 2 else ''})"
+                  if nrec > 1 else "")
         tree.item(info["iid"], values=(
-            f"{nrec} record{'s' if nrec != 1 else ''}, "
+            f"{nrec} record{'s' if nrec != 1 else ''}{pauses}, "
             f"{fmt_duration(meta['duration_s'])}, "
             f"{meta['n_comments']} comments",))
         for ch in meta["channels"]:
@@ -643,7 +793,8 @@ def main_gui(initial_files):
             jobs.append({"path": info["path"], "out_base": out_base,
                          "sel_indices": sel, "bucket_s": bucket_s,
                          "fmt": fmt_var.get(), "out_dir": out_dir,
-                         "include_comments": comments_var.get()})
+                         "include_comments": comments_var.get(),
+                         "split_on_pause": split_var.get()})
         if not jobs:
             messagebox.showerror(APP_NAME, "No channels selected.")
             return
@@ -747,15 +898,17 @@ def run_selftest(log_path, files):
             out_dir = os.path.dirname(os.path.abspath(log_path))
             base = "selftest_" + os.path.splitext(os.path.basename(path))[0]
             evs = []
-            runs = [(base, f, True) for f in ("csv", "parquet", "xlsx")]
-            runs.append((base + "_nc", "csv", False))
-            for out_base, fmt, inc in runs:
+            runs = [(base, f, True, False)
+                    for f in ("csv", "parquet", "xlsx")]
+            runs.append((base + "_nc", "csv", False, False))
+            runs.append((base + "_split", "csv", True, True))
+            for out_base, fmt, inc, split in runs:
                 written = export_one(
                     path=path, out_base=out_base,
                     sel_indices=[c["index"] for c in meta["channels"]],
                     bucket_s=60.0, fmt=fmt, out_dir=out_dir,
-                    include_comments=inc, emit=evs.append,
-                    cancel=threading.Event())
+                    include_comments=inc, split_on_pause=split,
+                    emit=evs.append, cancel=threading.Event())
                 for w in written:
                     lines.append(f"  wrote {w} ({os.path.getsize(w):,} bytes)")
         lines.append("SELFTEST PASS")
